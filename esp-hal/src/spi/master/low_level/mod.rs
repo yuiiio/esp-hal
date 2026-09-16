@@ -429,8 +429,54 @@ impl Driver {
     /// [`Self::transfer`] instead
     #[cfg_attr(place_spi_master_driver_in_ram, ram)]
     pub(super) fn read_from_fifo(&self, words: &mut [u8]) -> Result<(), Error> {
-        if words.len() > FIFO_SIZE {
+        let len = words.len();
+        if len > FIFO_SIZE {
             return Err(Error::FifoSizeExeeded);
+        }
+
+        let dst = words.as_mut_ptr();
+
+        // `copy_from_slice` on a four byte slice lowers to a `memcpy` call, which
+        // costs far more than the FIFO read itself. Store whole registers when the
+        // destination is word aligned, which is the common case for block oriented
+        // callers such as SD cards.
+        if (dst as usize).is_multiple_of(4) {
+            let mut written = 0;
+            for w_reg in self.regs().w_iter() {
+                if written == len {
+                    break;
+                }
+                let reg_val = w_reg.read().bits().to_le();
+
+                if len - written >= 4 {
+                    // SAFETY: at least four bytes are left in `words` and `dst` is
+                    // 4-byte aligned, so `dst + written` is a valid aligned `u32`.
+                    unsafe { dst.add(written).cast::<u32>().write(reg_val) };
+                    written += 4;
+                } else {
+                    // This is the path short reads (such as single byte SD card
+                    // polling) take. The stores are volatile only to keep them from
+                    // being recognised as a `memcpy` again, which would reintroduce
+                    // a call for one to three bytes.
+                    let bytes = reg_val.to_ne_bytes();
+                    let rest = len - written;
+                    // SAFETY: `written + i < len` for every `i < rest`.
+                    unsafe {
+                        if rest >= 1 {
+                            dst.add(written).write_volatile(bytes[0]);
+                        }
+                        if rest >= 2 {
+                            dst.add(written + 1).write_volatile(bytes[1]);
+                        }
+                        if rest >= 3 {
+                            dst.add(written + 2).write_volatile(bytes[2]);
+                        }
+                    }
+                    break;
+                }
+            }
+
+            return Ok(());
         }
 
         for (chunk, w_reg) in words.chunks_mut(4).zip(self.regs().w_iter()) {
