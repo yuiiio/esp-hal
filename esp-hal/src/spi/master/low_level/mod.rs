@@ -338,8 +338,19 @@ impl Driver {
     pub(super) fn fill_fifo(&self, chunk: &[u8]) {
         let (chunks, rem) = chunk.as_chunks::<4>();
         let mut w_iter = self.regs().w_iter();
-        for c in chunks {
-            if let Some(w_reg) = w_iter.next() {
+
+        // `u32::from_le_bytes` on a `[u8; 4]` of unknown alignment lowers to four
+        // byte loads plus shifts and ors. Load whole words when the source is
+        // aligned, which is the common case for block oriented callers.
+        if (chunk.as_ptr() as usize).is_multiple_of(4) {
+            for (i, w_reg) in w_iter.by_ref().take(chunks.len()).enumerate() {
+                // SAFETY: `i < chunks.len()` so the read stays inside `chunk`, and
+                // `chunk` is 4-byte aligned.
+                let word = unsafe { chunk.as_ptr().cast::<u32>().add(i).read() };
+                w_reg.write(|w| w.buf().set(u32::from_le(word)));
+            }
+        } else {
+            for (c, w_reg) in chunks.iter().zip(w_iter.by_ref()) {
                 let word = u32::from_le_bytes(*c);
                 w_reg.write(|w| w.buf().set(word));
             }
